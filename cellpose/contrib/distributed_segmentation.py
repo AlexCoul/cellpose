@@ -24,6 +24,8 @@ except ModuleNotFoundError as e:
     raise DistSegError("Install 'cellpose[distributed]' for distributed segmentation dependencies") from e
 
 
+MODELS_V1 = ['cyto','nuclei','tissuenet','livecell']#, 'cyto2', 'general']
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,10 +34,13 @@ def segment(
     channels,
     model_type,
     diameter,
+    pretrained_model=False,
     fast_mode=False,
     use_anisotropy=True,
+    anisotropy=None,
     iou_depth=2,
     iou_threshold=0.7,
+    **model_kwargs,
 ):
     """Use cellpose to segment nuclei in fluorescence data.
 
@@ -46,7 +51,10 @@ def segment(
     channels : array of int with size 2
         See cellpose
     model_type : str
-        "cyto" or "nuclei"
+        any model that is available in the GUI, use name in GUI e.g. 'livecell' 
+        (can be user-trained or model zoo) 
+    pretrained_model: str or list of strings (optional, default False)
+        full path to pretrained cellpose model(s), if None or False, no model loaded
     diameter : tuple of size 3
         Approximate diameter (in pixels) of a segmented region, i.e. cell width
     fast_mode : bool
@@ -70,7 +78,8 @@ def segment(
     assert diameter[1] == diameter[2], diameter
 
     diameter_yx = diameter[1]
-    anisotropy = diameter[0] / diameter[1] if use_anisotropy else None
+    if anisotropy is None:
+        anisotropy = diameter[0] / diameter[1] if use_anisotropy else None
 
     image = da.asarray(image)
     image = image.rechunk({-1: -1})  # color channel is chunked together
@@ -91,11 +100,13 @@ def segment(
 
     labeled_blocks = np.empty(image.numblocks[:-1], dtype=object)
     total = None
+    da_segment_chunk = functools.partial(segment_chunk, **model_kwargs)
     for index, input_block in block_iter:
-        labeled_block, n = dask.delayed(segment_chunk, nout=2)(
+        labeled_block, n = dask.delayed(da_segment_chunk, nout=2)(
             input_block,
             channels,
             model_type,
+            pretrained_model,
             diameter_yx,
             anisotropy,
             fast_mode,
@@ -154,10 +165,12 @@ def segment_chunk(
     chunk,
     channels,
     model_type,
+    pretrained_model,
     diameter_yx,
     anisotropy,
     fast_mode,
     index,
+    **kwargs,
 ):
     """Perform segmentation on an individual chunk."""
     # Cellpose seems to have some randomness, which is made deterministic by using the block
@@ -166,21 +179,40 @@ def segment_chunk(
 
     from cellpose import models
 
-    model = models.Cellpose(gpu=True, model_type=model_type, net_avg=not fast_mode)
+    eval_params = {
+        'batch_size': 8, 'channels': None, 'channel_axis': None, 'z_axis': None, 
+        'normalize': True, 'invert': False, 'rescale': None, 'diameter': None, 
+        'do_3D': False, 'anisotropy': None, 'net_avg': False, 'augment': False, 
+        'tile': True, 'tile_overlap': 0.1, 'resample': True, 'interp': True,
+        'flow_threshold': 0.4, 'cellprob_threshold': 0.0, 'compute_masks': True, 
+        'min_size': 15, 'stitch_threshold': 0.0, 'progress': None,  
+        'loop_run': False, 'model_loaded': False}
+    eval_params = {
+        'channels': channels,
+        'z_axis': 0,
+        'channel_axis': 3,
+        'diameter': diameter_yx,
+        'do_3D': True,
+        'anisotropy': anisotropy,
+        'net_avg': not fast_mode,
+        'augment': not fast_mode,
+        'tile': not fast_mode,
+    }
+    eval_params.update(**kwargs)
+    eval_params.update(eval_params)
+    
+    model = models.CellposeModel(
+        gpu=True, 
+        pretrained_model=pretrained_model,
+        model_type=model_type, 
+        net_avg=not fast_mode,
+        )
 
     logger.info("Evaluating model")
-    segments, _, _, _ = model.eval(
+    segments = model.eval(
         chunk,
-        channels=channels,
-        z_axis=0,
-        channel_axis=3,
-        diameter=diameter_yx,
-        do_3D=True,
-        anisotropy=anisotropy,
-        net_avg=not fast_mode,
-        augment=not fast_mode,
-        tile=not fast_mode,
-    )
+        **eval_params,
+    )[0]
     logger.info("Done segmenting chunk")
 
     return segments.astype(np.int32), segments.max()
